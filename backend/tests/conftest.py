@@ -36,7 +36,8 @@ def clean():
             conn.execute(f"TRUNCATE TABLE {row['names']} RESTART IDENTITY CASCADE")
         conn.execute(
             "INSERT INTO users(username, display_name, role) VALUES "
-            "('editor1', '王编辑', 'editor'), ('teacher1', '李老师', 'teacher')")
+            "('editor1', '王编辑', 'editor'), ('teacher1', '李老师', 'teacher'), "
+            "('teacher2', '赵老师', 'teacher')")
         conn.commit()
     yield
 

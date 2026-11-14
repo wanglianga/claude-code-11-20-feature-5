@@ -7,12 +7,16 @@ import Citations from './pages/Citations.jsx'
 import EditorBuild from './pages/EditorBuild.jsx'
 import EditorSynonyms from './pages/EditorSynonyms.jsx'
 import EditorReplacements from './pages/EditorReplacements.jsx'
+import EvalQuerySets from './pages/EvalQuerySets.jsx'
+import EvalRuns from './pages/EvalRuns.jsx'
 
 function Layout({ children }) {
   const { user, logout } = useAuth()
   const tabs = [
     { to: '/search', label: '教材检索', roles: ['teacher', 'editor'] },
     { to: '/citations', label: '引用核查', roles: ['teacher', 'editor'] },
+    { to: '/eval/query-sets', label: '评测查询集', roles: ['teacher', 'editor'] },
+    { to: '/eval/runs', label: '配置评测', roles: ['teacher', 'editor'] },
     { to: '/editor/build', label: '构建监控', roles: ['editor'] },
     { to: '/editor/synonyms', label: '同义词审核', roles: ['editor'] },
     { to: '/editor/replacements', label: '版本替代', roles: ['editor'] },
@@ -54,6 +58,8 @@ export default function App() {
       <Route path="/search" element={<Protected><Search /></Protected>} />
       <Route path="/units/:id" element={<Protected><UnitView /></Protected>} />
       <Route path="/citations" element={<Protected><Citations /></Protected>} />
+      <Route path="/eval/query-sets" element={<Protected><EvalQuerySets /></Protected>} />
+      <Route path="/eval/runs" element={<Protected><EvalRuns /></Protected>} />
       <Route path="/editor/build" element={<Protected editorOnly><EditorBuild /></Protected>} />
       <Route path="/editor/synonyms" element={<Protected editorOnly><EditorSynonyms /></Protected>} />
       <Route path="/editor/replacements" element={<Protected editorOnly><EditorReplacements /></Protected>} />

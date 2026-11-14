@@ -247,6 +247,128 @@ CREATE TABLE IF NOT EXISTS {schema}.citation_checks (
     detail          text NOT NULL,
     checked_at      timestamptz NOT NULL DEFAULT now()
 );
+
+-- ============================================================
+-- 候选配置评测：查询集 / 标注 / 配置 / 运行快照 / 逐条结果
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS {schema}.eval_query_sets (
+    set_id          bigserial PRIMARY KEY,
+    name            text NOT NULL,
+    description     text NOT NULL DEFAULT '',
+    scope           jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    status          text NOT NULL DEFAULT 'draft'
+                    CHECK (status IN ('draft', 'frozen', 'archived')),
+    created_by      text NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    frozen_at       timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS {schema}.eval_queries (
+    query_id        bigserial PRIMARY KEY,
+    set_id          bigint NOT NULL REFERENCES {schema}.eval_query_sets(set_id),
+    query_text      text NOT NULL,
+    question_type   text NOT NULL DEFAULT 'concept',
+    volume          text NOT NULL DEFAULT '',
+    note            text NOT NULL DEFAULT '',
+    status          text NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'disabled')),
+    disabled_reason text NOT NULL DEFAULT '',
+    created_by      text NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (set_id, query_text)
+);
+CREATE INDEX IF NOT EXISTS idx_eval_queries_set ON {schema}.eval_queries (set_id);
+
+CREATE TABLE IF NOT EXISTS {schema}.eval_annotations (
+    annotation_id   bigserial PRIMARY KEY,
+    query_id        bigint NOT NULL REFERENCES {schema}.eval_queries(query_id),
+    unit_code       text NOT NULL,
+    grade           integer NOT NULL CHECK (grade BETWEEN 1 AND 3),
+    required_source boolean NOT NULL DEFAULT false,
+    equiv_group     uuid,
+    annotator       text NOT NULL,
+    note            text NOT NULL DEFAULT '',
+    status          text NOT NULL DEFAULT 'proposed'
+                    CHECK (status IN ('proposed', 'adjudicated', 'rejected')),
+    adjudicated_by  text,
+    adjudicated_at  timestamptz,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (query_id, unit_code, annotator)
+);
+CREATE INDEX IF NOT EXISTS idx_eval_ann_query ON {schema}.eval_annotations (query_id);
+
+CREATE TABLE IF NOT EXISTS {schema}.eval_configs (
+    config_id       bigserial PRIMARY KEY,
+    name            text NOT NULL UNIQUE,
+    description     text NOT NULL DEFAULT '',
+    settings        jsonb NOT NULL,
+    status          text NOT NULL DEFAULT 'candidate'
+                    CHECK (status IN ('candidate', 'baseline', 'published', 'retired')),
+    created_by      text NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    published_at    timestamptz,
+    compat_report   jsonb NOT NULL DEFAULT '{{}}'::jsonb
+);
+
+CREATE TABLE IF NOT EXISTS {schema}.eval_runs (
+    run_id              bigserial PRIMARY KEY,
+    set_id              bigint NOT NULL REFERENCES {schema}.eval_query_sets(set_id),
+    baseline_config_id  bigint NOT NULL REFERENCES {schema}.eval_configs(config_id),
+    candidate_config_id bigint NOT NULL REFERENCES {schema}.eval_configs(config_id),
+    status              text NOT NULL DEFAULT 'running'
+                        CHECK (status IN ('running', 'paused', 'completed', 'failed')),
+    seed                integer NOT NULL,
+    bootstrap_iters     integer NOT NULL DEFAULT 1000,
+    top_k               integer NOT NULL DEFAULT 10,
+    eval_timeout_ms     integer NOT NULL DEFAULT 2000,
+    snapshot            jsonb NOT NULL,
+    total_queries       integer NOT NULL DEFAULT 0,
+    done_queries        integer NOT NULL DEFAULT 0,
+    ok_queries          integer NOT NULL DEFAULT 0,
+    timeout_queries     integer NOT NULL DEFAULT 0,
+    error_queries       integer NOT NULL DEFAULT 0,
+    summary             jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    adoption_decision   text CHECK (adoption_decision IS NULL
+                        OR adoption_decision IN ('adopted', 'rejected')),
+    decided_by          text,
+    decided_at          timestamptz,
+    decision_note       text NOT NULL DEFAULT '',
+    created_by          text NOT NULL,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    started_at          timestamptz NOT NULL DEFAULT now(),
+    finished_at         timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_eval_runs_set ON {schema}.eval_runs (set_id);
+
+CREATE TABLE IF NOT EXISTS {schema}.eval_run_queries (
+    id              bigserial PRIMARY KEY,
+    run_id          bigint NOT NULL REFERENCES {schema}.eval_runs(run_id),
+    query_id        bigint NOT NULL,
+    config_side     text NOT NULL CHECK (config_side IN ('baseline', 'candidate')),
+    status          text NOT NULL CHECK (status IN ('ok', 'timeout', 'error', 'no_scope')),
+    error           text NOT NULL DEFAULT '',
+    elapsed_ms      integer NOT NULL DEFAULT 0,
+    ranked_hits     jsonb NOT NULL DEFAULT '[]'::jsonb,
+    metrics         jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+    UNIQUE (run_id, query_id, config_side)
+);
+CREATE INDEX IF NOT EXISTS idx_eval_rq_run ON {schema}.eval_run_queries (run_id);
+
+CREATE TABLE IF NOT EXISTS {schema}.eval_disabled_samples (
+    sample_id       bigserial PRIMARY KEY,
+    generation_id   bigint NOT NULL,
+    unit_code       text NOT NULL,
+    reason          text NOT NULL,
+    status          text NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'applied', 'ignored')),
+    created_by      text NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    decided_by      text,
+    decided_at      timestamptz,
+    UNIQUE (generation_id, unit_code)
+);
 """
 
 
@@ -287,7 +409,8 @@ def init_schema() -> None:
         )
         conn.execute(
             "INSERT INTO users(username, display_name, role) VALUES "
-            "('editor1', '王编辑', 'editor'), ('teacher1', '李老师', 'teacher') "
+            "('editor1', '王编辑', 'editor'), ('teacher1', '李老师', 'teacher'), "
+            "('teacher2', '赵老师', 'teacher') "
             "ON CONFLICT (username) DO NOTHING"
         )
         conn.commit()

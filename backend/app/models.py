@@ -188,3 +188,60 @@ class BuildReport(BaseModel):
     error: str
     chapters: list[dict]
     issues: list[dict]
+
+
+# ---------------------------------------------------------------- 候选配置评测
+
+class QuerySetIn(BaseModel):
+    name: str = Field(min_length=1)
+    description: str = ""
+    scope: dict = Field(default_factory=dict)
+
+
+class EvalQueryIn(BaseModel):
+    query_text: str = Field(min_length=1)
+    question_type: str = "concept"
+    volume: str = ""
+    note: str = ""
+
+
+class AnnotationIn(BaseModel):
+    unit_code: str = Field(min_length=1)
+    grade: int = Field(ge=1, le=3)
+    required_source: bool = False
+    equiv_group: str | None = None
+    note: str = ""
+
+
+class AdjudicationIn(BaseModel):
+    query_id: int
+    # 教研员裁定后的有效标注集合（全量覆盖该查询的 proposed 标注）
+    annotations: list[AnnotationIn]
+
+
+class ConfigIn(BaseModel):
+    name: str = Field(min_length=1)
+    description: str = ""
+    settings: dict
+
+
+class RunCreateIn(BaseModel):
+    set_id: int
+    baseline_config_id: int
+    candidate_config_id: int
+    seed: int = 20261114
+    bootstrap_iters: int = Field(default=1000, ge=100, le=10000)
+    top_k: int = Field(default=10, ge=1, le=50)
+    eval_timeout_ms: int = Field(default=2000, ge=50, le=30000)
+    batch_size: int = Field(default=20, ge=1, le=200)
+
+
+class AdoptionIn(BaseModel):
+    decision: str  # adopted | rejected
+    note: str = ""
+
+
+class DisabledSampleIn(BaseModel):
+    generation_id: int
+    unit_code: str = Field(min_length=1)
+    reason: str = Field(min_length=1)

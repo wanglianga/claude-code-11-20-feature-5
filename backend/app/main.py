@@ -14,12 +14,14 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import importer, search as searchmod
+from . import evaluation as evalmod
 from .config import settings
 from .db import init_schema, tx
 from .models import (
-    BuildReport, BuildRequest, CitationCreate, CitationOut, LoginRequest,
-    ReplacementIn, SearchRequest, SynonymIn, SynonymOut, TextbookOut,
-    UnitOut, UserOut,
+    AdoptionIn, AdjudicationIn, AnnotationIn, BuildReport, BuildRequest,
+    CitationCreate, CitationOut, ConfigIn, DisabledSampleIn, EvalQueryIn,
+    LoginRequest, QuerySetIn, ReplacementIn, RunCreateIn, SearchRequest,
+    SynonymIn, SynonymOut, TextbookOut, UnitOut, UserOut,
 )
 
 
@@ -467,9 +469,451 @@ def retire_generation(generation_id: int, editor: dict = Depends(require_editor)
     return dict(row)
 
 
+# ============================================================
+# 候选配置评测（教师建查询集/标注，教研员仲裁，编辑发起对比与采用决策）
+# ============================================================
+
+def _require_researcher(user: dict) -> None:
+    """教研员职责由编辑角色承担（演示环境不新增角色）。"""
+    if user["role"] != "editor":
+        raise HTTPException(403, "仅教研员（编辑角色）可裁定标注分歧")
+
+
+@app.get("/api/eval/query-sets")
+def list_query_sets(user: dict = Depends(current_user)):
+    with tx() as conn:
+        rows = conn.execute(
+            "SELECT s.*, (SELECT count(*) FROM eval_queries q "
+            " WHERE q.set_id=s.set_id AND q.status='active') AS query_count "
+            "FROM eval_query_sets s ORDER BY s.set_id DESC").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["created_at"] = r["created_at"].isoformat()
+            d["frozen_at"] = r["frozen_at"].isoformat() if r["frozen_at"] else None
+            out.append(d)
+        return out
+
+
+@app.post("/api/eval/query-sets")
+def create_query_set(req: QuerySetIn, user: dict = Depends(current_user)):
+    scope = req.scope or {}
+    with tx() as conn:
+        row = conn.execute(
+            "INSERT INTO eval_query_sets(name, description, scope, created_by) "
+            "VALUES (%s,%s,%s,%s) RETURNING *",
+            (req.name, req.description,
+             json.dumps(scope, ensure_ascii=False), user["username"])).fetchone()
+        conn.commit()
+    return dict(row)
+
+
+@app.get("/api/eval/query-sets/{set_id}")
+def get_query_set(set_id: int, user: dict = Depends(current_user)):
+    with tx() as conn:
+        s = conn.execute("SELECT * FROM eval_query_sets WHERE set_id=%s",
+                         (set_id,)).fetchone()
+        if not s:
+            raise HTTPException(404, "查询集不存在")
+        queries = conn.execute(
+            "SELECT * FROM eval_queries WHERE set_id=%s ORDER BY query_id",
+            (set_id,)).fetchall()
+        result = dict(s)
+        result["queries"] = []
+        for q in queries:
+            qd = dict(q)
+            qd["annotations"] = [dict(a) for a in conn.execute(
+                "SELECT * FROM eval_annotations WHERE query_id=%s "
+                "ORDER BY annotation_id", (q["query_id"],)).fetchall()]
+            result["queries"].append(qd)
+        return result
+
+
+@app.post("/api/eval/query-sets/{set_id}/queries")
+def add_eval_query(set_id: int, req: EvalQueryIn,
+                   user: dict = Depends(current_user)):
+    if req.question_type not in evalmod.VALID_QUESTION_TYPES:
+        raise HTTPException(422,
+                            f"question_type 取值：{evalmod.VALID_QUESTION_TYPES}")
+    with tx() as conn:
+        s = conn.execute("SELECT * FROM eval_query_sets WHERE set_id=%s",
+                         (set_id,)).fetchone()
+        if not s:
+            raise HTTPException(404, "查询集不存在")
+        if s["status"] != "draft":
+            raise HTTPException(409, "查询集已冻结，不能再增改查询；请复制为新查询集")
+        try:
+            row = conn.execute(
+                "INSERT INTO eval_queries"
+                "(set_id, query_text, question_type, volume, note, created_by) "
+                "VALUES (%s,%s,%s,%s,%s,%s) RETURNING *",
+                (set_id, req.query_text.strip(), req.question_type,
+                 req.volume, req.note, user["username"])).fetchone()
+            conn.commit()
+        except Exception as exc:
+            raise HTTPException(409, f"该查询集已存在相同查询：{exc}")
+    return dict(row)
+
+
+@app.post("/api/eval/queries/{query_id}/disable")
+def disable_eval_query(query_id: int, body: dict,
+                       user: dict = Depends(current_user)):
+    with tx() as conn:
+        q = conn.execute("SELECT * FROM eval_queries WHERE query_id=%s",
+                         (query_id,)).fetchone()
+        if not q:
+            raise HTTPException(404, "查询不存在")
+        s = conn.execute("SELECT * FROM eval_query_sets WHERE set_id=%s",
+                         (q["set_id"],)).fetchone()
+        if s["status"] != "draft":
+            raise HTTPException(409, "查询集已冻结，停用须在冻结前完成")
+        row = conn.execute(
+            "UPDATE eval_queries SET status='disabled', "
+            "disabled_reason=%s, updated_at=now() WHERE query_id=%s RETURNING *",
+            (body.get("reason", "维护停用"), query_id)).fetchone()
+        conn.commit()
+    return dict(row)
+
+
+@app.post("/api/eval/queries/{query_id}/annotations")
+def add_annotation(query_id: int, req: AnnotationIn,
+                   user: dict = Depends(current_user)):
+    with tx() as conn:
+        q = conn.execute("SELECT * FROM eval_queries WHERE query_id=%s",
+                         (query_id,)).fetchone()
+        if not q:
+            raise HTTPException(404, "查询不存在")
+        s = conn.execute("SELECT * FROM eval_query_sets WHERE set_id=%s",
+                         (q["set_id"],)).fetchone()
+        if s["status"] != "draft":
+            raise HTTPException(409, "查询集已冻结，标注不可变更")
+        # 标注的段落必须真实存在于查询集适用范围对应的索引中
+        scope = s["scope"]
+        gens = evalmod.searchmod.resolve_generations(
+            conn, scope.get("isbns", []), scope.get("stages", []),
+            scope.get("subjects", []), scope.get("include_deprecated", False))
+        unit = conn.execute(
+            "SELECT * FROM structural_units WHERE unit_code=%s "
+            "AND generation_id = ANY(%s)",
+            (req.unit_code, [g["gid"] for g in gens])).fetchone()
+        if not unit:
+            raise HTTPException(422, "标注段落不在该查询集适用范围内，拒绝标注")
+        try:
+            row = conn.execute(
+                "INSERT INTO eval_annotations"
+                "(query_id, unit_code, grade, required_source, equiv_group, "
+                " annotator, note) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING *",
+                (query_id, req.unit_code, req.grade, req.required_source,
+                 req.equiv_group or None, user["username"], req.note)).fetchone()
+            conn.commit()
+        except Exception as exc:
+            raise HTTPException(409, f"你已标注过该段落：{exc}")
+    return dict(row)
+
+
+@app.post("/api/eval/query-sets/{set_id}/adjudicate")
+def adjudicate(set_id: int, req: AdjudicationIn,
+               user: dict = Depends(current_user)):
+    """教研员裁定：以提交的全量标注替换该查询的有效标注，旧标注全部 rejected。"""
+    _require_researcher(user)
+    with tx() as conn:
+        s = conn.execute("SELECT * FROM eval_query_sets WHERE set_id=%s",
+                         (set_id,)).fetchone()
+        if not s:
+            raise HTTPException(404, "查询集不存在")
+        if s["status"] != "draft":
+            raise HTTPException(409, "查询集已冻结，不能再裁定")
+        q = conn.execute("SELECT * FROM eval_queries WHERE query_id=%s AND set_id=%s",
+                         (req.query_id, set_id)).fetchone()
+        if not q:
+            raise HTTPException(404, "查询不属于该查询集")
+        if not req.annotations:
+            raise HTTPException(422, "裁定标注不能为空")
+        conn.execute(
+            "UPDATE eval_annotations SET status='rejected' WHERE query_id=%s",
+            (req.query_id,))
+        created = []
+        for ann in req.annotations:
+            row = conn.execute(
+                "INSERT INTO eval_annotations"
+                "(query_id, unit_code, grade, required_source, equiv_group, "
+                " annotator, note, status, adjudicated_by, adjudicated_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,'adjudicated',%s,now()) RETURNING *",
+                (req.query_id, ann.unit_code, ann.grade, ann.required_source,
+                 ann.equiv_group or None, user["username"], ann.note,
+                 user["username"])).fetchone()
+            created.append(dict(row))
+        conn.commit()
+    return {"query_id": req.query_id, "adjudicated": created}
+
+
+@app.post("/api/eval/query-sets/{set_id}/freeze")
+def freeze_set(set_id: int, user: dict = Depends(current_user)):
+    with tx() as conn:
+        try:
+            result = evalmod.freeze_query_set(conn, set_id)
+            conn.commit()
+        except evalmod.EvalError as exc:
+            raise HTTPException(409, str(exc))
+    return result
+
+
+@app.get("/api/eval/configs")
+def list_configs(user: dict = Depends(current_user)):
+    with tx() as conn:
+        rows = conn.execute(
+            "SELECT * FROM eval_configs ORDER BY config_id DESC").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["created_at"] = r["created_at"].isoformat()
+            d["published_at"] = r["published_at"].isoformat() if r["published_at"] else None
+            out.append(d)
+        return out
+
+
+@app.post("/api/eval/configs")
+def create_config(req: ConfigIn, user: dict = Depends(current_user)):
+    allowed = {"bm25_k1", "bm25_b", "synonym_enabled", "bigram_enabled", "top_k"}
+    unknown = set(req.settings) - allowed
+    if unknown:
+        raise HTTPException(422, f"不支持的配置项：{sorted(unknown)}；允许：{sorted(allowed)}")
+    with tx() as conn:
+        try:
+            row = conn.execute(
+                "INSERT INTO eval_configs(name, description, settings, created_by) "
+                "VALUES (%s,%s,%s,%s) RETURNING *",
+                (req.name, req.description,
+                 json.dumps(req.settings, ensure_ascii=False),
+                 user["username"])).fetchone()
+            conn.commit()
+        except Exception as exc:
+            raise HTTPException(409, f"配置名已存在：{exc}")
+    return dict(row)
+
+
+@app.post("/api/eval/configs/{config_id}/compatibility")
+def check_compatibility(config_id: int, user: dict = Depends(current_user)):
+    with tx() as conn:
+        try:
+            report = evalmod.compatibility_report(conn, config_id)
+        except evalmod.EvalError as exc:
+            raise HTTPException(404, str(exc))
+        conn.execute(
+            "UPDATE eval_configs SET compat_report=%s WHERE config_id=%s",
+            (json.dumps(report, ensure_ascii=False), config_id))
+        conn.commit()
+    return report
+
+
+@app.post("/api/eval/configs/{config_id}/publish")
+def publish_config(config_id: int, user: dict = Depends(current_user)):
+    """发布前再次核对当前索引兼容；不兼容则拒绝发布。评测结果不改变普通查询路径。"""
+    if user["role"] != "editor":
+        raise HTTPException(403, "仅编辑可发布候选配置")
+    with tx() as conn:
+        cfg = conn.execute("SELECT * FROM eval_configs WHERE config_id=%s",
+                           (config_id,)).fetchone()
+        if not cfg:
+            raise HTTPException(404, "配置不存在")
+        report = evalmod.compatibility_report(conn, config_id)
+        if not report["compatible"]:
+            raise HTTPException(409,
+                                "当前索引与配置不兼容，拒绝发布："
+                                + "；".join(report["problems"]))
+        row = conn.execute(
+            "UPDATE eval_configs SET status='published', published_at=now(), "
+            "compat_report=%s WHERE config_id=%s RETURNING *",
+            (json.dumps(report, ensure_ascii=False), config_id)).fetchone()
+        conn.commit()
+    return dict(row)
+
+
+@app.get("/api/eval/runs")
+def list_runs(user: dict = Depends(current_user)):
+    with tx() as conn:
+        rows = conn.execute(
+            "SELECT r.*, s.name AS set_name, cb.name AS baseline_name, "
+            "cc.name AS candidate_name FROM eval_runs r "
+            "JOIN eval_query_sets s ON s.set_id=r.set_id "
+            "JOIN eval_configs cb ON cb.config_id=r.baseline_config_id "
+            "JOIN eval_configs cc ON cc.config_id=r.candidate_config_id "
+            "ORDER BY r.run_id DESC").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            for key in ("started_at", "finished_at", "decided_at", "created_at"):
+                if d.get(key) is not None and hasattr(d[key], "isoformat"):
+                    d[key] = d[key].isoformat()
+            out.append(d)
+        return out
+
+
+@app.post("/api/eval/runs")
+def create_run(req: RunCreateIn, user: dict = Depends(current_user)):
+    if user["role"] != "editor":
+        raise HTTPException(403, "仅编辑（检索维护人员）可发起对比评测")
+    with tx() as conn:
+        try:
+            run = evalmod.create_run(conn, req.model_dump(), user["username"])
+            conn.commit()
+        except evalmod.EvalError as exc:
+            raise HTTPException(409, str(exc))
+        # 首个批次立即执行，前端可用同一接口轮询续接
+        run = evalmod.process_run(conn, run["run_id"], req.batch_size)
+        conn.commit()
+    return evalmod._run_json(run)
+
+
+@app.post("/api/eval/runs/{run_id}/process")
+def process_run(run_id: int, body: dict | None = None,
+                user: dict = Depends(current_user)):
+    if user["role"] != "editor":
+        raise HTTPException(403, "仅编辑可驱动评测批次")
+    batch = int((body or {}).get("batch_size", 20))
+    with tx() as conn:
+        try:
+            run = evalmod.process_run(conn, run_id, batch)
+            conn.commit()
+        except evalmod.EvalError as exc:
+            raise HTTPException(404, str(exc))
+    return evalmod._run_json(run)
+
+
+@app.post("/api/eval/runs/{run_id}/pause")
+def pause_run(run_id: int, user: dict = Depends(current_user)):
+    if user["role"] != "editor":
+        raise HTTPException(403, "仅编辑可暂停评测")
+    with tx() as conn:
+        try:
+            run = evalmod.pause_run(conn, run_id)
+            conn.commit()
+        except evalmod.EvalError as exc:
+            raise HTTPException(409, str(exc))
+    return evalmod._run_json(run)
+
+
+@app.post("/api/eval/runs/{run_id}/resume")
+def resume_run(run_id: int, body: dict | None = None,
+               user: dict = Depends(current_user)):
+    if user["role"] != "editor":
+        raise HTTPException(403, "仅编辑可续接评测")
+    batch = int((body or {}).get("batch_size", 20))
+    with tx() as conn:
+        try:
+            run = evalmod.resume_run(conn, run_id, batch)
+            conn.commit()
+        except evalmod.EvalError as exc:
+            raise HTTPException(409, str(exc))
+    return evalmod._run_json(run)
+
+
+@app.get("/api/eval/runs/{run_id}")
+def get_run(run_id: int, user: dict = Depends(current_user)):
+    with tx() as conn:
+        try:
+            return evalmod.run_detail(conn, run_id)
+        except evalmod.EvalError as exc:
+            raise HTTPException(404, str(exc))
+
+
+@app.post("/api/eval/runs/{run_id}/decision")
+def adoption_decision(run_id: int, req: AdoptionIn,
+                      user: dict = Depends(current_user)):
+    if user["role"] != "editor":
+        raise HTTPException(403, "仅编辑可登记采用决策")
+    with tx() as conn:
+        try:
+            run = evalmod.decide_adoption(
+                conn, run_id, req.decision, req.note, user["username"])
+            conn.commit()
+        except evalmod.EvalError as exc:
+            raise HTTPException(409, str(exc))
+    return evalmod._run_json(run)
+
+
+@app.get("/api/eval/disabled-samples")
+def list_disabled_samples(status: str = "all",
+                          user: dict = Depends(current_user)):
+    sql = ("SELECT d.*, t.title AS textbook_title FROM eval_disabled_samples d "
+           "JOIN index_generations g ON g.generation_id=d.generation_id "
+           "JOIN textbook_editions e ON e.edition_id=g.edition_id "
+           "JOIN textbooks t ON t.isbn=e.isbn")
+    params: tuple = ()
+    if status != "all":
+        sql += " WHERE d.status=%s"
+        params = (status,)
+    sql += " ORDER BY d.sample_id DESC"
+    with tx() as conn:
+        rows = conn.execute(sql, params).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["created_at"] = r["created_at"].isoformat()
+            d["decided_at"] = r["decided_at"].isoformat() if r["decided_at"] else None
+            out.append(d)
+        return out
+
+
+@app.post("/api/eval/disabled-samples")
+def create_disabled_sample(req: DisabledSampleIn,
+                           user: dict = Depends(current_user)):
+    """段落停用标记样本：先进入待维护队列，裁定应用后才在后续评测中排除。"""
+    with tx() as conn:
+        gen = conn.execute(
+            "SELECT * FROM index_generations WHERE generation_id=%s",
+            (req.generation_id,)).fetchone()
+        if not gen:
+            raise HTTPException(404, "索引代次不存在")
+        unit = conn.execute(
+            "SELECT * FROM structural_units WHERE generation_id=%s AND unit_code=%s",
+            (req.generation_id, req.unit_code)).fetchone()
+        if not unit:
+            raise HTTPException(422, "该代次内找不到此段落标识")
+        try:
+            row = conn.execute(
+                "INSERT INTO eval_disabled_samples"
+                "(generation_id, unit_code, reason, created_by) "
+                "VALUES (%s,%s,%s,%s) RETURNING *",
+                (req.generation_id, req.unit_code, req.reason,
+                 user["username"])).fetchone()
+            conn.commit()
+        except Exception as exc:
+            raise HTTPException(409, f"该段落已有停用样本：{exc}")
+    return dict(row)
+
+
+@app.post("/api/eval/disabled-samples/{sample_id}/decide")
+def decide_disabled_sample(sample_id: int, body: dict,
+                           user: dict = Depends(current_user)):
+    if user["role"] != "editor":
+        raise HTTPException(403, "仅编辑可裁定停用样本")
+    decision = body.get("status")
+    if decision not in ("applied", "ignored"):
+        raise HTTPException(422, "status 必须为 applied 或 ignored")
+    with tx() as conn:
+        row = conn.execute(
+            "UPDATE eval_disabled_samples SET status=%s, decided_by=%s, "
+            "decided_at=now() WHERE sample_id=%s AND status='pending' RETURNING *",
+            (decision, user["username"], sample_id)).fetchone()
+        conn.commit()
+    if not row:
+        raise HTTPException(409, "样本不存在或已裁定")
+    return dict(row)
+
+
 # ---------------------------------------------------------------- 前端静态资源
 
-static_dir = os.getenv("STATIC_DIR", "/workspace/20/frontend/dist")
+def _resolve_static_dir() -> str:
+    configured = os.getenv("STATIC_DIR", "/workspace/20/frontend/dist")
+    if os.path.isdir(configured):
+        return configured
+    repo_local = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "dist"))
+    return repo_local if os.path.isdir(repo_local) else configured
+
+
+static_dir = _resolve_static_dir()
 if os.path.isdir(static_dir):
     from fastapi.staticfiles import StaticFiles
     app.mount("/assets", StaticFiles(directory=os.path.join(static_dir, "assets")),
